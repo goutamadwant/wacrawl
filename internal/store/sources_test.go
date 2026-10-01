@@ -88,6 +88,48 @@ func TestLegacyAdoptionMatchesFirstDuplicateEvent(t *testing.T) {
 	if len(data.Messages) != 2 || len(data.Sources) != 1 || data.Sources[0].EventID != "wa:1" || data.Sources[0].MatchKind != "legacy" {
 		t.Fatalf("legacy adoption changed event identity: %d messages, %+v", len(data.Messages), data.Sources)
 	}
+	assertRepeat(t, st, "adopted", incoming)
+}
+
+func TestLegacyAdoptionSkipsClaimedEvent(t *testing.T) {
+	ctx := context.Background()
+	st := reloginStore(t)
+	first, second := reloginMessage(1, "shared"), reloginMessage(2, "shared")
+	if err := st.MergeAll(ctx, ImportStats{}, nil, nil, nil, nil, []Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `update messages set source_row_pk=1 where source_pk=2`); err != nil {
+		t.Fatal(err)
+	}
+	stats := reloginStats("adopted")
+	stats.AdoptSource = true
+	key, _ := eventDiscriminator(first)
+	if _, err := st.DB().ExecContext(ctx, `insert into message_sources(account_identity,source_store_identity,source_row_pk,discriminator,event_id,match_kind) values(?,?,?,?,?,?)`, stats.AccountIdentity, stats.SourceStoreIdentity, 99, key, "wa:1", "legacy"); err != nil {
+		t.Fatal(err)
+	}
+	incoming := reloginMessage(10, "shared")
+	incoming.SourceRowPK = 1
+	fresh := reloginMessage(11, "fresh")
+	if err := st.ValidateImport(ctx, stats, []Message{incoming, fresh}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MergeAll(ctx, stats, nil, nil, nil, nil, []Message{incoming, fresh}); err != nil {
+		t.Fatal(err)
+	}
+	data := snapshotRelogin(t, st)
+	if len(data.Messages) != 3 || len(data.Sources) != 3 {
+		t.Fatalf("adoption lost history: %d messages, %+v", len(data.Messages), data.Sources)
+	}
+	var matched bool
+	for _, source := range data.Sources {
+		if source.SourceRowPK == 1 {
+			matched = source.EventID == "wa:2" && source.MatchKind == "legacy"
+		}
+	}
+	if !matched {
+		t.Fatalf("adoption reused an already claimed event: %+v", data.Sources)
+	}
+	assertRepeat(t, st, "adopted", incoming, fresh)
 }
 
 func mergeRelogin(t *testing.T, st *Store, source string, messages ...Message) {
