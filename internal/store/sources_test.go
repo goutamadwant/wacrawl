@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,6 +29,65 @@ func reloginStats(source string) ImportStats {
 
 func reloginMessage(pk int64, id string) Message {
 	return Message{SourcePK: pk, ChatJID: "chat@g.us", MessageID: id, SenderJID: "sender@s.whatsapp.net", Timestamp: time.Unix(1750000000, 0).UTC(), Text: "body " + id, RawType: 0, MessageType: "text"}
+}
+
+func BenchmarkLegacyAdoption(b *testing.B) {
+	for _, count := range []int{500, 1000, 2000} {
+		b.Run(fmt.Sprintf("messages=%d", count), func(b *testing.B) {
+			ctx := context.Background()
+			st, err := Open(ctx, filepath.Join(b.TempDir(), "archive.db"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = st.Close() }()
+			archived := make([]Message, count)
+			incoming := make([]Message, count)
+			for i := range archived {
+				archived[i] = reloginMessage(int64(i+1), fmt.Sprintf("old-%d", i))
+				incoming[i] = reloginMessage(int64(count+i+1), fmt.Sprintf("new-%d", i))
+			}
+			if err := st.MergeAll(ctx, ImportStats{FinishedAt: time.Unix(1800000000, 0).UTC()}, nil, nil, nil, nil, archived); err != nil {
+				b.Fatal(err)
+			}
+			stats := reloginStats("adopted")
+			for b.Loop() {
+				tx, err := st.DB().BeginTx(ctx, nil)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := resolveImportMessages(ctx, tx, false, stats, incoming, nil); err != nil {
+					b.Fatal(err)
+				}
+				if err := tx.Rollback(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyAdoptionMatchesFirstDuplicateEvent(t *testing.T) {
+	ctx := context.Background()
+	st := reloginStore(t)
+	first := reloginMessage(1, "shared")
+	second := reloginMessage(2, "shared")
+	if err := st.MergeAll(ctx, ImportStats{FinishedAt: time.Unix(1800000000, 0).UTC()}, nil, nil, nil, nil, []Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `update messages set source_row_pk=1 where source_pk=2`); err != nil {
+		t.Fatal(err)
+	}
+	incoming := reloginMessage(10, "shared")
+	incoming.SourceRowPK = 1
+	stats := reloginStats("adopted")
+	stats.AdoptSource = true
+	if err := st.MergeAll(ctx, stats, nil, nil, nil, nil, []Message{incoming}); err != nil {
+		t.Fatal(err)
+	}
+	data := snapshotRelogin(t, st)
+	if len(data.Messages) != 2 || len(data.Sources) != 1 || data.Sources[0].EventID != "wa:1" || data.Sources[0].MatchKind != "legacy" {
+		t.Fatalf("legacy adoption changed event identity: %d messages, %+v", len(data.Messages), data.Sources)
+	}
 }
 
 func mergeRelogin(t *testing.T, st *Store, source string, messages ...Message) {
